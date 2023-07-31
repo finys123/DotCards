@@ -1,0 +1,20 @@
+{
+	"tables": [{
+		"name": "users",
+		"columns": [
+            {
+				"name": "id",
+				"type": "int",
+                "isPrimaryKey": true
+			},
+			{
+				"name": "name",
+				"type": "varchar(50)"
+			},
+			{
+				"name": "email",
+				"type": "varchar(100)"
+			}
+		]
+	}]
+}

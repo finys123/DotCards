@@ -1,138 +1,185 @@
 // app.ts
-
 import express, { Request, Response } from 'express';
-import mysql from 'mysql2/promise'; // Updated import for mysql2
+import { Connection, createConnection, RowDataPacket } from 'mysql2'; // Updated import for mysql2
 import fs from 'fs';
 import { promisify } from 'util';
 
+import { Column, Schema, Table } from './models';
+
 export const app = express();
 const readFileAsync = promisify(fs.readFile);
-
 app.use(express.json());
 
-const pool = mysql.createPool({
+const dbConfig: Parameters<typeof createConnection>[0] = {
   host: 'localhost',
   user: 'root',
   password: 'root123',
   database: 'CustomerDB',
   connectionLimit: 10, // Adjust this as per your needs
-});
+};
 
-function validateData(data: any, requiredFields: string[]): string[] {
-  const missingFields: string[] = [];
-  for (const field of requiredFields) {
-    if (!(field in data)) {
-      missingFields.push(field);
+let db: Connection;
+(async () => {
+  try {
+    db = await createConnection(dbConfig);
+    console.log('Connected to MySQL database!');
+  } catch (err) {
+    console.error('Error connecting to MySQL:', err);
+  }
+})();
+
+function getCreateColumnSQL(column: Column) {
+  let colSQL = `${column.name} ${column.type}`;
+  if (column.isPrimaryKey) {
+    colSQL += ' PRIMARY KEY';
+    if (column.autoIncrement) {
+      colSQL += ' AUTO_INCREMENT';
     }
   }
-  return missingFields;
+  if (column.unique) {
+    colSQL += ' UNIQUE';
+  }
+  if (column.default) {
+    colSQL += ` DEFAULT ${column.default}`;
+  }
+  return colSQL;
 }
 
-export async function createTablesFromSchema(): Promise<void> {
-  try {
-    const schemaData: string = await readFileAsync('schema.json', 'utf8');
-    const schema: Record<string, string> = JSON.parse(schemaData);
-
-    Object.keys(schema).forEach(async (tableName) => {
-      const table = schema[tableName];
-      const createTableQuery = `CREATE TABLE IF NOT EXISTS ${tableName} (${table})`;
-
-      try {
-        await executeQuery(createTableQuery);
-        console.log(`Table '${tableName}' created.`);
-      } catch (err) {
-        console.error(`Error creating table '${tableName}':`, err);
+function createTables(tables: Table[]) {
+  tables.forEach((table) => {
+    const createTableSQL = `CREATE TABLE IF NOT EXISTS ${table.name} (${table.columns.map(col => getCreateColumnSQL(col)).join(", ")})`;
+    db.query<RowDataPacket[]>(createTableSQL, (err, results) => {
+      if (err) {
+        console.error(`Error creating table ${table.name}: ${err.message}`);
+      } else {
+        console.log(`Table ${table.name} created.`);
+        if (results) {
+          console.log(results);
+          const tableFields = results.map((field: any) => field.name);
+          table.columns.forEach((column) => {
+            if (!tableFields.includes(column.name)) {
+              const alterTableSQL = `ALTER TABLE ${table.name} ADD COLUMN ${getCreateColumnSQL(column)}`;
+              db.query(alterTableSQL, (err) => {
+                if (err) {
+                  console.error(`Error adding column ${column.name} to table ${table.name}: ${err.message}`);
+                } else {
+                  console.log(`Column ${column.name} added to table ${table.name}.`);
+                }
+              });
+            }
+          });
+        }
       }
     });
-  } catch (err) {
-    console.error('Error reading schema file:', err);
-  }
+  });
 }
 
-app.post('/:collection', async (req: Request, res: Response) => {
+function tableNotFound(res: Response, tableName: string) {
+  return res.status(404).json({ error: `Table '${tableName}' not found.` });
+}
+
+function columnNotFound(res: Response, columnName: string) {
+  return res.status(404).json({ error: `Column '${columnName}' not found.` });
+}
+
+function handleError(res: Response, error: Error) {
+  console.error("Error:", error.message);
+  return res.status(500).json({ error: "Something went wrong." });
+}
+
+// Create a new tables
+app.post('/:collection', (req: Request, res: Response) => {
   const { collection } = req.params;
-  const data = req.body;
+  const data: Schema = req.body;
+  console.log(JSON.stringify(data));
 
-  const requiredFields = ['name', 'email'];
-
-  const missingFields = validateData(data, requiredFields);
-  if (missingFields.length > 0) {
-    return res.status(400).json({ success: false, message: `Missing fields: ${missingFields.join(', ')}` });
+  if (!data.tables) {
+    handleError(res, new Error('Invalid schema JSON.'));
   }
-
-  const keys = Object.keys(data);
-  const values = Object.values(data);
-  const placeholders = new Array(keys.length).fill('?').join(', ');
-  const insertQuery = `INSERT INTO ${collection} (${keys.join(', ')}) VALUES (${placeholders})`;
-
-  try {
-    const result = await executeQuery(insertQuery, values);
-    res.json({ success: true, id: result[0].insertId });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Error inserting data.' });
-  }
+  createTables(data.tables);
 });
 
-app.get('/:collection/:id', async (req: Request, res: Response) => {
+// Read a single record by ID
+app.get('/:collection/:id', (req: Request, res: Response) => {
   const { collection, id } = req.params;
-  const selectQuery = `SELECT * FROM ${collection} WHERE id = ?`;
 
-  try {
-    const result = await executeQuery(selectQuery, [id]);
-    if (result[0].length === 0) {
-      return res.status(404).json({ success: false, message: 'Resource not found.' });
+  db.query<RowDataPacket[]>(`SELECT * FROM ${collection} WHERE id = ?`, [id], (err, results) => {
+    if (err) {
+      return handleError(res, err);
     }
-    res.json({ success: true, data: result[0][0] });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Error fetching data.' });
-  }
+    if (results.length === 0) {
+      return res.status(404).json({ error: `Record with ID ${id} not found.` });
+    }
+    res.json(results[0]);
+  });
 });
 
-app.put('/:collection/:id', async (req: Request, res: Response) => {
+// Update a record by ID
+app.post('/:collection/:id', (req: Request, res: Response) => {
   const { collection, id } = req.params;
   const data = req.body;
 
-  const requiredFields = ['name', 'email'];
-
-  const missingFields = validateData(data, requiredFields);
-  if (missingFields.length > 0) {
-    return res.status(400).json({ success: false, message: `Missing fields: ${missingFields.join(', ')}` });
+  // Check if the ID provided is a valid number
+  const recordId = parseInt(id);
+  if (isNaN(recordId) || recordId <= 0) {
+    return res.status(400).json({ error: 'Invalid record ID.' });
   }
 
-  const updateQuery = `UPDATE ${collection} SET ? WHERE id = ?`;
-
-  try {
-    await executeQuery(updateQuery, [data, id]);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Error updating data.' });
-  }
-});
-
-app.delete('/:collection/:id', async (req: Request, res: Response) => {
-  const { collection, id } = req.params;
-  const deleteQuery = `DELETE FROM ${collection} WHERE id = ?`;
-
-  try {
-    const result = await executeQuery(deleteQuery, [id]);
-    if (result[0].affectedRows === 0) {
-      return res.status(404).json({ success: false, message: 'Resource not found.' });
+  db.query<RowDataPacket[]>(`SELECT * FROM ${collection} WHERE id = ?`, [recordId], (err, results) => {
+    if (err) {
+      return handleError(res, err);
     }
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Error deleting data.' });
-  }
+    if (results.length === 0) {
+      return res.status(404).json({ error: `Record with ID ${recordId} not found.` });
+    }
+
+    // Perform the update
+    const columns = Object.keys(data).join(" = ?, ") + " = ?";
+    const values = Object.values(data);
+    values.push(recordId);
+
+    db.query(`UPDATE ${collection} SET ${columns} WHERE id = ?`, values, (err) => {
+      if (err) {
+        return handleError(res, err);
+      }
+      res.json({ id: recordId, ...data });
+    });
+  });
 });
 
-async function executeQuery(query: string, values: any[] = []): Promise<any> {
-  const connection = await pool.getConnection();
-  try {
-    const result = await connection.query(query, values);
-    return result;
-  } finally {
-    connection.release();
+// Delete a record by ID
+app.delete('/:collection/:id', (req: Request, res: Response) => {
+  const { collection, id } = req.params;
+
+  // Check if the ID provided is a valid number
+  const recordId = parseInt(id);
+  if (isNaN(recordId) || recordId <= 0) {
+    return res.status(400).json({ error: 'Invalid record ID.' });
   }
-}
+
+  db.query<RowDataPacket[]>(`SELECT * FROM ${collection} WHERE id = ?`, [recordId], (err, results) => {
+    if (err) {
+      return handleError(res, err);
+    }
+    if (results.length === 0) {
+      return res.status(404).json({ error: `Record with ID ${recordId} not found.` });
+    }
+
+    // Perform the delete
+    db.query(`DELETE FROM ${collection} WHERE id = ?`, [recordId], (err, deleteResult) => {
+      if (err) {
+        return handleError(res, err);
+      }
+
+      // Check if the DELETE query was successful (OkPacket)
+      if (deleteResult && 'affectedRows' in deleteResult && deleteResult.affectedRows > 0) {
+        res.json({ message: `Record with ID ${recordId} deleted successfully.` });
+      } else {
+        return handleError(res, new Error('Failed to delete the record.'));
+      }
+    });
+  });
+});
 
 const port = 3000;
 app.listen(port, () => {
