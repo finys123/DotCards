@@ -7,8 +7,7 @@ export interface Column {
     default?: string;
 }
 
-export interface Table {
-    name: string;
+export interface TableFields {
     columns: Column[];
     foreignKeys?: ForeignKey[];
 }
@@ -18,8 +17,4 @@ export interface ForeignKey {
     references: string;
     onDelete?: string;
     onUpdate?: string;
-}
-
-export interface Schema {
-    tables: Table[];
 }

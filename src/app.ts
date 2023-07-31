@@ -4,7 +4,7 @@ import { Connection, createConnection, RowDataPacket } from 'mysql2'; // Updated
 import fs from 'fs';
 import { promisify } from 'util';
 
-import { Column, Schema, Table } from './models';
+import { Column, TableFields } from './models';
 
 export const app = express();
 const readFileAsync = promisify(fs.readFile);
@@ -45,30 +45,22 @@ function getCreateColumnSQL(column: Column) {
   return colSQL;
 }
 
-function createTables(tables: Table[]) {
-  tables.forEach((table) => {
-    const createTableSQL = `CREATE TABLE IF NOT EXISTS ${table.name} (${table.columns.map(col => getCreateColumnSQL(col)).join(", ")})`;
-    db.query<RowDataPacket[]>(createTableSQL, (err, results) => {
+async function createTables(tableName: string, fields: TableFields): Promise<string> {
+  const [rows] = await db.promise().query<RowDataPacket[][]>('SHOW TABLES LIKE ?', [tableName]);
+  if (rows.length > 0) {
+    return Promise.reject(`Table ${tableName} already exists.`);
+  }
+
+  const createTableSQL = `CREATE TABLE IF NOT EXISTS ${tableName} (${fields.columns.map(col => getCreateColumnSQL(col)).join(", ")})`;
+
+  return await new Promise((resolve, reject) => {
+    db.query(createTableSQL, (err) => {
       if (err) {
-        console.error(`Error creating table ${table.name}: ${err.message}`);
+        console.error(`Error creating table ${tableName}: ${err.message}`);
+        reject(err.message);
       } else {
-        console.log(`Table ${table.name} created.`);
-        if (results) {
-          console.log(results);
-          const tableFields = results.map((field: any) => field.name);
-          table.columns.forEach((column) => {
-            if (!tableFields.includes(column.name)) {
-              const alterTableSQL = `ALTER TABLE ${table.name} ADD COLUMN ${getCreateColumnSQL(column)}`;
-              db.query(alterTableSQL, (err) => {
-                if (err) {
-                  console.error(`Error adding column ${column.name} to table ${table.name}: ${err.message}`);
-                } else {
-                  console.log(`Column ${column.name} added to table ${table.name}.`);
-                }
-              });
-            }
-          });
-        }
+        console.log(`Table ${tableName} created.`);
+        resolve(`Table ${tableName} created.`);
       }
     });
   });
@@ -90,13 +82,17 @@ function handleError(res: Response, error: Error) {
 // Create a new tables
 app.post('/:collection', (req: Request, res: Response) => {
   const { collection } = req.params;
-  const data: Schema = req.body;
+  const data: TableFields = req.body;
   console.log(JSON.stringify(data));
 
-  if (!data.tables) {
-    handleError(res, new Error('Invalid schema JSON.'));
-  }
-  createTables(data.tables);
+  
+  createTables(collection, data)
+    .then(message => {
+      return res.status(200).json({ message });
+    })
+    .catch(err => {
+      return res.status(500).json({ err });
+    })
 });
 
 // Read a single record by ID
@@ -121,29 +117,46 @@ app.post('/:collection/:id', (req: Request, res: Response) => {
 
   // Check if the ID provided is a valid number
   const recordId = parseInt(id);
-  if (isNaN(recordId) || recordId <= 0) {
+  if (isNaN(recordId) || recordId < 0) {
     return res.status(400).json({ error: 'Invalid record ID.' });
   }
 
-  db.query<RowDataPacket[]>(`SELECT * FROM ${collection} WHERE id = ?`, [recordId], (err, results) => {
-    if (err) {
-      return handleError(res, err);
-    }
+  db.query<RowDataPacket[]>(`SHOW KEYS FROM ${collection} WHERE Key_name = 'PRIMARY'`, (err, results) => {
     if (results.length === 0) {
-      return res.status(404).json({ error: `Record with ID ${recordId} not found.` });
+      return res.status(500).json({ error: `${collection} not found.` });
+    } else {
+      const primaryKey = results[0]["Column_name"];
+      db.query<RowDataPacket[]>(`SELECT * FROM ${collection} WHERE ${primaryKey} = ?`, [recordId], (err, results) => {
+        if (err) {
+          return handleError(res, err);
+        }
+        if (results.length === 0) {
+          // Perform the insert
+          const columns = [primaryKey].concat(Object.keys(data)).join(', ');
+          const valuePlaceholder = '?, ' + Object.keys(data).map(key => '?').join(', ');
+          const values = [recordId].concat(Object.values(data));
+    
+          db.query(`INSERT INTO ${collection} (${columns}) VALUES (${valuePlaceholder})`, values, (err) => {
+            if (err) {
+              return handleError(res, err);
+            }
+            res.json({ id: recordId, ...data });
+          });
+        } else {
+          // Perform the update
+          const columns = Object.keys(data).join(" = ?, ") + " = ?";
+          const values = Object.values(data);
+          values.push(recordId);
+    
+          db.query(`UPDATE ${collection} SET ${columns} WHERE ${primaryKey} = ?`, values, (err) => {
+            if (err) {
+              return handleError(res, err);
+            }
+            res.json({ id: recordId, ...data });
+          });
+        }
+      });
     }
-
-    // Perform the update
-    const columns = Object.keys(data).join(" = ?, ") + " = ?";
-    const values = Object.values(data);
-    values.push(recordId);
-
-    db.query(`UPDATE ${collection} SET ${columns} WHERE id = ?`, values, (err) => {
-      if (err) {
-        return handleError(res, err);
-      }
-      res.json({ id: recordId, ...data });
-    });
   });
 });
 
@@ -157,27 +170,34 @@ app.delete('/:collection/:id', (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Invalid record ID.' });
   }
 
-  db.query<RowDataPacket[]>(`SELECT * FROM ${collection} WHERE id = ?`, [recordId], (err, results) => {
-    if (err) {
-      return handleError(res, err);
-    }
+  db.query<RowDataPacket[]>(`SHOW KEYS FROM ${collection} WHERE Key_name = 'PRIMARY'`, (err, results) => {
     if (results.length === 0) {
-      return res.status(404).json({ error: `Record with ID ${recordId} not found.` });
+      return res.status(500).json({ error: `${collection} not found.` });
+    } else {
+      const primaryKey = results[0]["Column_name"];
+      db.query<RowDataPacket[]>(`SELECT * FROM ${collection} WHERE ${primaryKey} = ?`, [recordId], (err, results) => {
+        if (err) {
+          return handleError(res, err);
+        }
+        if (results.length === 0) {
+          return res.status(404).json({ error: `Record with ID ${recordId} not found.` });
+        }
+    
+        // Perform the delete
+        db.query(`DELETE FROM ${collection} WHERE ${primaryKey} = ?`, [recordId], (err, deleteResult) => {
+          if (err) {
+            return handleError(res, err);
+          }
+    
+          // Check if the DELETE query was successful (OkPacket)
+          if (deleteResult && 'affectedRows' in deleteResult && deleteResult.affectedRows > 0) {
+            res.json({ message: `Record with ID ${recordId} deleted successfully.` });
+          } else {
+            return handleError(res, new Error('Failed to delete the record.'));
+          }
+        });
+      });
     }
-
-    // Perform the delete
-    db.query(`DELETE FROM ${collection} WHERE id = ?`, [recordId], (err, deleteResult) => {
-      if (err) {
-        return handleError(res, err);
-      }
-
-      // Check if the DELETE query was successful (OkPacket)
-      if (deleteResult && 'affectedRows' in deleteResult && deleteResult.affectedRows > 0) {
-        res.json({ message: `Record with ID ${recordId} deleted successfully.` });
-      } else {
-        return handleError(res, new Error('Failed to delete the record.'));
-      }
-    });
   });
 });
 

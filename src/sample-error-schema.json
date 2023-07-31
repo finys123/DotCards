@@ -1,0 +1,15 @@
+{
+    "columns": [{
+            "name": "id",
+            "autoIncrement": true
+        },
+        {
+            "name": "title",
+            "type": "varchar(100)"
+        },
+        {
+            "name": "content",
+            "type": "text"
+        }
+    ]
+}
