@@ -66,14 +66,6 @@ async function createTables(tableName: string, fields: TableFields): Promise<str
   });
 }
 
-function tableNotFound(res: Response, tableName: string) {
-  return res.status(404).json({ error: `Table '${tableName}' not found.` });
-}
-
-function columnNotFound(res: Response, columnName: string) {
-  return res.status(404).json({ error: `Column '${columnName}' not found.` });
-}
-
 function handleError(res: Response, error: Error) {
   console.error("Error:", error.message);
   return res.status(500).json({ error: "Something went wrong." });
